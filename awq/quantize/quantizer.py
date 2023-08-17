@@ -19,37 +19,45 @@ def scale_activations(module):
         if isinstance(module.mlp.gelu_impl, ScaledActivation):
             return
         c = module.mlp.dense_h_to_4h.out_features
-        act = ScaledActivation(
-            module.mlp.gelu_impl, 
-            torch.ones(c, dtype=dtype, device=device)
-        )
+        act = ScaledActivation(module.mlp.gelu_impl,
+                               torch.ones(c, dtype=dtype, device=device))
         set_op_by_name(module, "mlp.gelu_impl", act)
     elif 'mptblock' in str(module.__class__.__name__).lower():
         if isinstance(module.ffn.act, ScaledActivation):
             return
         c = module.ffn.up_proj.out_features
-        act = ScaledActivation(
-            module.ffn.act, 
-            torch.ones(c, dtype=dtype, device=device)
-        )
+        act = ScaledActivation(module.ffn.act,
+                               torch.ones(c, dtype=dtype, device=device))
         set_op_by_name(module, "ffn.act", act)
     elif 'falcon' in str(module.__class__).lower():
         if isinstance(module.mlp.act, ScaledActivation):
             return
         c = module.mlp.dense_h_to_4h.out_features
-        act = ScaledActivation(
-            module.mlp.act, 
-            torch.ones(c, dtype=dtype, device=device)
-        )
+        act = ScaledActivation(module.mlp.act,
+                               torch.ones(c, dtype=dtype, device=device))
         set_op_by_name(module, "mlp.act", act)
-    
+
+
+def llama_attention_kvcache(module):
+    if 'llama' in str(module.__class__.__name__).lower():
+        from .qmodule import QuantLLaMaAttention
+        quant_llama_attention = QuantLLaMaAttention(
+            module.self_attn,
+            module.self_attn.max_position_embeddings,
+            module.self_attn.hidden_size,
+            module.self_attn.num_heads,
+            module.self_attn.num_key_value_heads,
+            rope_scaling=module.self_attn.config.rope_scaling)
+        set_op_by_name(module, "self_attn", quant_llama_attention)
+
 
 # core quantization method (simulated quantization)
-def pseudo_quantize_tensor(w, n_bit=8,
-                           zero_point=True, q_group_size=-1,
+def pseudo_quantize_tensor(w,
+                           n_bit=8,
+                           zero_point=True,
+                           q_group_size=-1,
                            inplace=False,
-                           get_scale_zp=False
-                           ):
+                           get_scale_zp=False):
     org_w_shape = w.shape
     if q_group_size > 0:
         assert org_w_shape[-1] % q_group_size == 0
@@ -58,7 +66,7 @@ def pseudo_quantize_tensor(w, n_bit=8,
     if zero_point:
         max_val = w.amax(dim=1, keepdim=True)
         min_val = w.amin(dim=1, keepdim=True)
-        max_int = 2 ** n_bit - 1
+        max_int = 2**n_bit - 1
         min_int = 0
         scales = (max_val - min_val).clamp(min=1e-5) / max_int
         zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
@@ -66,8 +74,8 @@ def pseudo_quantize_tensor(w, n_bit=8,
         assert min_val is None
         max_val = w.abs().amax(dim=1, keepdim=True)
         max_val = max_val.clamp(min=1e-5)
-        max_int = 2 ** (n_bit - 1) - 1
-        min_int = - 2 ** (n_bit - 1)
+        max_int = 2**(n_bit - 1) - 1
+        min_int = -2**(n_bit - 1)
         scales = max_val / max_int
         zeros = 0
 
@@ -78,8 +86,8 @@ def pseudo_quantize_tensor(w, n_bit=8,
         ((w.div_(scales).round_().add_(zeros)).clamp_(
             min_int, max_int).sub_(zeros)).mul_(scales)
     else:
-        w = (torch.clamp(torch.round(w / scales) +
-                         zeros, min_int, max_int) - zeros) * scales
+        w = (torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) -
+             zeros) * scales
     assert torch.isnan(w).sum() == 0
 
     w = w.reshape(org_w_shape)
@@ -89,53 +97,67 @@ def pseudo_quantize_tensor(w, n_bit=8,
     else:
         return w
 
+
 @torch.no_grad()
 def pseudo_quantize_model_weight(
-    model, w_bit, q_config,
-):    
+    model,
+    w_bit,
+    q_config,
+):
     from .pre_quant import get_blocks, get_named_linears
     layers = get_blocks(model)
     for i in tqdm(range(len(layers)), desc="pseudo weight quantization..."):
         named_linears = get_named_linears(layers[i])
         for n, m in named_linears.items():
             m.cuda()
-            m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bit=w_bit, **q_config)
+            m.weight.data = pseudo_quantize_tensor(m.weight.data,
+                                                   n_bit=w_bit,
+                                                   **q_config)
             m.cpu()
 
 
 @torch.no_grad()
 def real_quantize_model_weight(
-    model, w_bit, q_config,
-    init_only=False
+    model,
+    w_bit,
+    q_config,
+    init_only=False,
+    gpu_list=[0],
 ):
-    from .qmodule import WQLinear
+    from .qmodule import WQLinear, QuantLLaMaAttention
     from .pre_quant import get_blocks, get_named_linears
-    assert q_config["zero_point"], "We only support zero_point quantization now."
-    
+    assert q_config[
+        "zero_point"], "We only support zero_point quantization now."
+
+    num_gpus = len(gpu_list)
     layers = get_blocks(model)
-    for i in tqdm(range(len(layers)), desc="real weight quantization..." + ("(init only)" if init_only else "")):
+    for i in tqdm(range(len(layers)),
+                  desc="real weight quantization..." +
+                  ("(init only)" if init_only else "")):
         layer = layers[i]
         named_linears = get_named_linears(layer)
         scale_activations(layer)
 
         for name, module in named_linears.items():
             if init_only:
-                q_linear = WQLinear.from_linear(
-                    module, w_bit, q_config['q_group_size'], True)
-                q_linear.to(next(layer.parameters()).device)
-                set_op_by_name(layer, name, q_linear)
+                q_linear = WQLinear.from_linear(module, w_bit,
+                                                q_config['q_group_size'], True)
             else:
-                module.cuda()
-                module.weight.data, scales, zeros = pseudo_quantize_tensor(module.weight.data, n_bit=w_bit, get_scale_zp=True, **q_config)
+                module.cuda(int(gpu_list[i * num_gpus // len(layers)]))
+                print(
+                    f'debugging device: {gpu_list[i * num_gpus // len(layers)]}'
+                )
+                module.weight.data, scales, zeros = pseudo_quantize_tensor(
+                    module.weight.data,
+                    n_bit=w_bit,
+                    get_scale_zp=True,
+                    **q_config)
                 scales = scales.t().contiguous()
                 zeros = zeros.t().contiguous()
-                q_linear = WQLinear.from_linear(
-                    module, w_bit, q_config['q_group_size'], False, scales, zeros)
+                q_linear = WQLinear.from_linear(module, w_bit,
+                                                q_config['q_group_size'],
+                                                False, scales, zeros)
                 module.cpu()
-                q_linear.to(next(layer.parameters()).device)
-                set_op_by_name(layer, name, q_linear)
-                torch.cuda.empty_cache()
-                gc.collect()
-                
-    torch.cuda.empty_cache()
-    gc.collect()
+            set_op_by_name(layer, name, q_linear)
+            torch.cuda.empty_cache()
+            gc.collect()

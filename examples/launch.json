@@ -1,0 +1,26 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "predict_13bv7_kvcache.py",
+            "env": {"CUDA_VISIBLE_DEVICES": "0"},
+            "args": ["--seed=42", "--data_path=/home/13b_llama_kvcache_data",
+            "--predict_output_path=/home/PULSE_176bv5/predict/pjllama13bv7-kvcache",
+            "--tokenizer_name=/root/workspace/external_data/pjllama13bv7",
+            "--model_name=/root/workspace/external_data/pjllama13bv7",
+            "--train_max_len=1024",
+            "--gen_max_len=1024", "--do_eval", "--overwrite_output_dir",
+            "--output_dir=/home/PULSE_176bv5/model_dir/pjllama13bv7-kvcache",
+            "--remove_unused_columns=False", "--log_level=debug",
+            "--per_device_train_batch_size=2", "--per_device_eval_batch_size=1", "--gradient_accumulation_steps=2", "--overwrite_output_dir=True", "--logging_steps=4", "--report_to=tensorboard", "--save_steps=640", "--eval_steps=640", "--evaluation_strategy=steps", "--save_total_limit=2", "--metric_for_best_model=eval_loss", "--load_best_model_at_end=False", "--gradient_checkpointing=False", "--bf16_full_eval=False", "--bf16=False"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
