@@ -85,6 +85,20 @@ class MyArguments:
 
     gen_max_len: int = field(default=384, metadata={"help": "gen_max_len"})
 
+    w_bit: int = field(default=4,
+                       metadata={"help": "weight quant bit, 16 is no quant"})
+
+    use_kvcache: bool = field(default=False,
+                              metadata={"help": "use kvcache or not"})
+
+    kvcache_bit: int = field(
+        default=8,
+        metadata={"help": "kvcache quant bits if use_kvcache opens"})
+
+    kvcache_groupsize: int = field(
+        default=128,
+        metadata={"help": "kvcache quant groupsize if use_kvcache opens"})
+
     def __post_init__(self):
         pass
 
@@ -117,46 +131,50 @@ class MyTrainer(Seq2SeqTrainer):
             from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model, load_checkpoint_and_dispatch
             from awq.quantize.quantizer import real_quantize_model_weight
             from awq.quantize.pre_quant import apply_kvcache
-            # model
-            '''
-            model = LlamaForCausalLM.from_pretrained(
-                my_args.model_name,
-                torch_dtype=torch.bfloat16,
-                # adapter_size=my_args.adapter_size,
-            )
-            '''
-            print("Loading pre-computed quantized weights...")
-            config = AutoConfig.from_pretrained(my_args.model_name,
-                                                trust_remote_code=True)
-            with init_empty_weights():
-                model = AutoModelForCausalLM.from_pretrained(
+
+            if my_args.w_bit == 16:
+                model = LlamaForCausalLM.from_pretrained(
                     my_args.model_name,
-                    config=config,
-                    torch_dtype=torch.float16,
-                    trust_remote_code=True)
-            use_kvcache = True
-            if use_kvcache:
-                awq_results = torch.load(
-                    '/root/workspace/external_data/pjllama13bv8/13bv7-w4-g128-awq.bin'
+                    torch_dtype=torch.bfloat16,
+                    # adapter_size=my_args.adapter_size,
                 )
-                apply_kvcache(model, 8, 128, awq_results["kvcache"])
-            q_config = {
-                "zero_point": True,  # by default True
-                "q_group_size": True,  # whether to use group quantization
-            }
-            real_quantize_model_weight(model,
-                                       w_bit=4,
-                                       q_config=q_config,
-                                       init_only=True)
-            model = load_checkpoint_and_dispatch(
-                model,
-                '/home/llm-awq/quant_cache/pjllama13bv7-w4-g128-weight.bin',
-                device_map="balanced",
-                # TODO: can we remove this?
-                no_split_module_classes=[
-                    "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock",
-                    "MPTBlock", "DecoderLayer"
-                ])
+            elif my_args.w_bit == 4:
+                print("Loading pre-computed quantized weights...")
+                config = AutoConfig.from_pretrained(my_args.model_name,
+                                                    trust_remote_code=True)
+                with init_empty_weights():
+                    model = AutoModelForCausalLM.from_pretrained(
+                        my_args.model_name,
+                        config=config,
+                        torch_dtype=torch.float16,
+                        trust_remote_code=True)
+                use_kvcache = my_args.use_kvcache
+                if use_kvcache:
+                    awq_results = torch.load(
+                        '/root/workspace/external_data/pjllama13bv8/13bv7-w4-g128-awq.bin'
+                    )
+                    apply_kvcache(model, my_args.kvcache_bit,
+                                  my_args.kvcache_groupsize,
+                                  awq_results["kvcache"])
+                q_config = {
+                    "zero_point": True,  # by default True
+                    "q_group_size": True,  # whether to use group quantization
+                }
+                real_quantize_model_weight(model,
+                                           w_bit=my_args.w_bit,
+                                           q_config=q_config,
+                                           init_only=True)
+                model = load_checkpoint_and_dispatch(
+                    model,
+                    '/home/llm-awq/quant_cache/pjllama13bv7-w4-g128-weight.bin',
+                    device_map="balanced",
+                    # TODO: can we remove this?
+                    no_split_module_classes=[
+                        "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock",
+                        "MPTBlock", "DecoderLayer"
+                    ])
+            else:
+                raise NotImplementedError("other wbit will support later.")
 
             # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
             # on a small vocab and want a smaller embedding size, remove this test.

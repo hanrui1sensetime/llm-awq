@@ -11,7 +11,7 @@
             "module": "awq.entry",
             // "env": {"CUDA_VISIBLE_DEVICES": "2, 3", "CUDA_LAUNCH_BLOCKING": "1"},
             // "args": ["--model_path", "/root/workspace/external_data/pjllama13bv7", "--w_bit", "4", "--q_group_size", "128", "--run_awq", "--dump_awq", "/root/workspace/external_data/pjllama13bv8/13bv7-w4-g128-awq.bin"],
-            "args": ["--model_path", "/root/workspace/external_data/pjllama13bv7", "--w_bit", "4", "--q_group_size", "128", "--auto_parallel", "--load_awq", "/root/workspace/external_data/pjllama13bv8/13bv7-w4-g128-awq.bin", "--q_backend", "real", "--dump_quant", "quant_cache/pjllama13bv7-w4-g128-weight.bin"],
+            "args": ["--model_path", "/root/workspace/external_data/pjllama13bv7", "--w_bit", "4", "--q_group_size", "128", "--auto_parallel", "--use_kvcache", "--load_awq", "/root/workspace/external_data/pjllama13bv8/13bv7-w4-g128-awq.bin", "--q_backend", "real", "--dump_quant", "quant_cache/pjllama13bv7-w4-g128-weight-2.bin"],
             // "args": ["--model_path", "/root/workspace/external_data/pjllama13bv7", "--w_bit", "4", "--q_group_size", "128", "--auto_parallel", "--load_awq", "/root/workspace/external_data/pjllama13bv8/13bv7-w4-g128-awq.bin", "--q_backend", "real", "--load_quant", "quant_cache/pjllama13bv7-w4-g128-weight.bin"],
             "justMyCode": false
         }
