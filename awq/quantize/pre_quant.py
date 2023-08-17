@@ -44,19 +44,19 @@ def move_embed(model, device):
     elif isinstance(model, OPTForCausalLM):
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(
             device)
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(
-            device)
+        model.model.decoder.embed_positions = \
+            model.model.decoder.embed_positions.to(device)
     elif isinstance(model, BloomForCausalLM):
-        model.transformer.word_embeddings = model.transformer.word_embeddings.to(
-            device)
-        model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.to(
-            device)
+        model.transformer.word_embeddings = \
+            model.transformer.word_embeddings.to(device)
+        model.transformer.word_embeddings_layernorm = \
+            model.transformer.word_embeddings_layernorm.to(device)
     elif "mpt" in str(model.__class__).lower():
         model.transformer.wte = model.transformer.wte.to(device)
         model.transformer.emb_drop = model.transformer.emb_drop.to(device)
     elif "falcon" in str(model.__class__).lower():
-        model.transformer.word_embeddings = model.transformer.word_embeddings.to(
-            device)
+        model.transformer.word_embeddings = \
+            model.transformer.word_embeddings.to(device)
     else:
         raise NotImplementedError(type(model))
 
@@ -71,10 +71,12 @@ def run_awq(
     seqlen=512,
     auto_scale=True,
     mse_range=True,
+    use_kvcache=False,
+    kvcache_bit=8,
+    kvcache_groupsize=128,
     # some configs for ablation study
     calib_data="pileval",
 ):
-    use_kvcache = True
     from ..utils.calib_data import get_calib_dataset
     from ..utils.module import append_str_prefix, get_op_name
 
@@ -172,26 +174,30 @@ def run_awq(
             _, k_cache_scale, k_cache_zp = pseudo_quantize_tensor(
                 kv_cache_feat['k_cache'].reshape(
                     batch, length, -1,
-                    128).permute(2, 0, 1, 3).reshape(-1, batch * length * 128),
-                8,
+                    kvcache_groupsize).permute(2, 0, 1, 3).reshape(
+                        -1, batch * length * kvcache_groupsize),
+                kvcache_bit,
                 True,
-                batch * length * 128,
+                batch * length * kvcache_groupsize,
                 get_scale_zp=True)
             _, v_cache_scale, v_cache_zp = pseudo_quantize_tensor(
                 kv_cache_feat['v_cache'].reshape(
                     batch, length, -1,
-                    128).permute(2, 0, 1, 3).reshape(-1, batch * length * 128),
-                8,
+                    kvcache_groupsize).permute(2, 0, 1, 3).reshape(
+                        -1, batch * length * kvcache_groupsize),
+                kvcache_bit,
                 True,
-                batch * length * 128,
+                batch * length * kvcache_groupsize,
                 get_scale_zp=True)
             awq_results['kvcache'].append(
-                (8, 128, k_cache_scale, k_cache_zp, v_cache_scale, v_cache_zp))
+                (kvcache_bit, kvcache_groupsize, k_cache_scale, k_cache_zp,
+                 v_cache_scale, v_cache_zp))
 
         # Clear GPU memory
         torch.cuda.empty_cache()
 
-        if auto_scale:  # if it applies, we should also modify the input_feat with scales
+        if auto_scale:
+            # if it applies, we should also modify the input_feat with scales
             scales_list = auto_scale_block(
                 layer,
                 layer_kwargs,
@@ -252,13 +258,13 @@ def apply_kvcache(model, kvcache_bit, kvcache_group_size, awq_kvcache):
             layer.self_attn.k_proj.weight.device,
             rope_scaling=layer.self_attn.config.rope_scaling)
         set_op_by_name(layer, "self_attn", quant_llama_attention)
-        layer.self_attn.pack_kvcache(kvcache_bit, kvcache_group_size,
-                                     kvcache_quant_param)
+        layer.self_attn.pack_kvcache(kvcache_quant_param)
 
 
-def apply_awq(model, awq_results):
+def apply_awq(model, awq_results, use_kvcache=False):
     apply_scale(model, awq_results["scale"])
     apply_clip(model, awq_results["clip"])
-    use_kvcache = True
+
     if use_kvcache:
-        apply_kvcache(model, 8, 128, awq_results["kvcache"])
+        apply_kvcache(model, awq_results["kvcache"][0][0],
+                      awq_results["kvcache"][0][1], awq_results["kvcache"])

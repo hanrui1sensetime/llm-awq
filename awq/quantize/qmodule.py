@@ -29,6 +29,7 @@ class UniformAffineQuantizer(nn.Module):
         metric="minmax",
     ):
         """
+        Modified from https://github.com/hahnyuan/RPTQ4LLM
         remove cluster quantize
         remove dynamic_method
         """
@@ -36,8 +37,6 @@ class UniformAffineQuantizer(nn.Module):
         self.symmetric = symmetric
         assert 2 <= n_bits <= 16, "bitwidth not supported"
         self.n_bits = n_bits
-        # self.qmin = -(2 ** (n_bits - 1))
-        # self.qmax = 2 ** (n_bits - 1) - 1
         self.qmin = 0
         self.qmax = 2**n_bits - 1
         self.per_channel_axes = per_channel_axes
@@ -50,7 +49,6 @@ class UniformAffineQuantizer(nn.Module):
         self.cached_xmin = None
         self.cached_xmax = None
 
-        self.mode = "calibration"
         self.enable = True
         self.recorded_quant_input = None
 
@@ -103,81 +101,10 @@ class UniformAffineQuantizer(nn.Module):
             return x
         if self.metric == "fix0to1":
             return x.mul_(255).round_().div_(255)
-        if self.mode == "calibration":
-            self.calibration(x)
-            return x
 
         # start quantization
         x_dequant = self.fake_quant(x, self.scale, self.round_zero_point)
         return x_dequant
-
-    def calibration(self, x: torch.Tensor):
-        reduce_axes = [
-            _ for _ in range(x.ndim)
-            if _ not in self.per_channel_axes and _ != self.cluster_dim
-        ]
-        if self.metric in ["minmax"]:
-            scale, zero_point = self.minmax_calibration(x, reduce_axes)
-
-        del self.scale
-        self.register_buffer("scale", scale)
-        # self.scale = scale
-        if zero_point is not None:
-            zero_point.clamp_(min=-1e4, max=1e4)
-            del self.zero_point, self.round_zero_point
-            self.register_buffer("zero_point", zero_point)
-            self.register_buffer("round_zero_point", zero_point.round())
-            # self.zero_point = zero_point
-            # self.round_zero_point = self.zero_point.round()
-
-        # debug
-
-        if torch.isinf(self.scale).any() or torch.isnan(self.scale).any():
-            breakpoint()
-        if self.zero_point is not None:
-            if (torch.isinf(self.round_zero_point).any()
-                    or torch.isnan(self.round_zero_point).any()):
-                breakpoint()
-        if x.size(0) == 1:
-            self.pack_dim = 1
-
-    def minmax_calibration(self, x, reduce_axes):
-        # minmax
-        if self.symmetric:
-            if len(reduce_axes):
-                abs_max = x.abs().amax(reduce_axes, keepdim=True)
-            else:
-                abs_max = x.abs()
-            scale = abs_max / (2**(self.n_bits - 1))
-            scale.clamp_(min=CLIPMIN, max=1e4)
-            zero_point = None
-        else:
-            if len(reduce_axes):
-                xmin = x.amin(reduce_axes, keepdim=True)
-                xmax = x.amax(reduce_axes, keepdim=True)
-            else:
-                xmin = x.clone()
-                xmax = x.clone()
-
-            if self.cached_xmax is not None:
-                if self.metric == "minmax":
-                    xmax = torch.max(self.cached_xmax, xmax)
-                    xmin = torch.min(self.cached_xmin, xmin)
-                if self.metric == "ema_minmax":
-                    xmax = self.cached_xmax * 0.99 + xmax * 0.01
-                    xmin = self.cached_xmin * 0.99 + xmin * 0.01
-            self.cached_xmax = xmax
-            self.cached_xmin = xmin
-            scale = (xmax - xmin) * (2**-self.n_bits)
-            scale.clamp_(min=CLIPMIN, max=1e4)
-            zero_point = (xmax + xmin) * (-0.5 / scale)
-            return scale, zero_point
-
-    def set_calibration_mode(self):
-        self.mode = "calibration"
-
-    def set_eval_mode(self):
-        self.mode = "eval"
 
     def free(self):
         del self.cached_xmin
@@ -395,9 +322,9 @@ class QuantLLaMaAttention(nn.Module):
                         device=dev))
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads}).")
+            raise ValueError("hidden_size must be divisible by num_heads (got"
+                             f"`hidden_size`: {self.hidden_size}"
+                             f" and `num_heads`: {self.num_heads}).")
 
         self.is_decoder = is_decoder
         self._init_rope()
@@ -407,34 +334,10 @@ class QuantLLaMaAttention(nn.Module):
         self.v_proj = org_module.v_proj
         self.q_proj = org_module.q_proj
         self.o_proj = org_module.o_proj
-        '''
-        self.qkt_matmul = QuantMatMul(
-            args.q_quant_params, args.k_quant_params, disable_act_quant=False, matmul_func=torch.bmm,
-        )
-        self.pv_matmul = QuantMatMul(
-            args.p_quant_params, args.v_quant_params, disable_act_quant=False, matmul_func=torch.bmm
-        )
-        '''
-        # self.use_weight_quant = False
-        # self.use_act_quant = False
 
-    def pack_kvcache(self, kvcache_bit, kvcache_groupsize,
-                     kvcache_quant_params):
+    def pack_kvcache(self, kvcache_quant_params):
         self.kcache_qzeros = kvcache_quant_params[1].to(dtype=torch.int32)
         self.kcache_scales = kvcache_quant_params[0].clone().half()
-        '''
-        vcache_zeros = kvcache_quant_params[3].to(dtype=torch.int32)
-        qzeros = torch.zeros((kcache_zeros.shape[0], kcache_zeros.shape[1] // 32 * kvcache_bit), dtype=torch.int32, device=kcache_zeros.device)
-        pack_num = 32 // kvcache_bit
-        for col in range(vcache_zeros.shape[1] // pack_num):
-            if kvcache_bit == 4:
-                order_map = [0, 2, 4, 6, 1, 3, 5, 7]
-            elif kvcache_bit == 8:
-                order_map = [0, 2, 1, 3]  # RIGHT?
-            for i in range(pack_num):
-                qzero_col = vcache_zeros[:, col * pack_num + order_map[i]]
-                qzeros[:, col] |= qzero_col << (i * kvcache_bit)
-        '''
         self.vcache_qzeros = kvcache_quant_params[3].to(dtype=torch.int32)
         self.vcache_scales = kvcache_quant_params[2].clone().half()
 
@@ -529,8 +432,6 @@ class QuantLLaMaAttention(nn.Module):
             assert use_cache
             past_key_value = (key_states, value_states) if use_cache else None
         else:
-            # quant_key_states = k_cache_quantizer.quant(key_states.transpose(0, 1).reshape(self.num_heads, -1), self.kcache_scales, self.kcache_qzeros, uint=True).reshape(self.num_heads, bsz, -1, self.head_dim).transpose(0, 1)
-            # quant_value_states = v_cache_quantizer.quant(value_states.transpose(0, 1).reshape(self.num_heads, -1), self.vcache_scales, self.vcache_qzeros, uint=True).reshape(self.num_heads, bsz, -1, self.head_dim).transpose(0, 1)
             assert use_cache
             key_states = quant_key_states
             value_states = quant_value_states
@@ -554,14 +455,15 @@ class QuantLLaMaAttention(nn.Module):
         del k_dequant
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                "Attention weights should be of size "
+                f"{(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                 f" {attn_weights.size()}")
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
+                raise ValueError("Attention mask should be of size "
+                                 f"{(bsz, 1, q_len, kv_seq_len)}, "
+                                 f"but is {attention_mask.size()}")
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
@@ -580,7 +482,8 @@ class QuantLLaMaAttention(nn.Module):
         del v_dequant
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                "`attn_output` should be of size "
+                f"{(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}")
 
         attn_output = attn_output.transpose(1, 2).contiguous()

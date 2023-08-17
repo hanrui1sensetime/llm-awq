@@ -32,6 +32,9 @@ parser.add_argument('--auto_parallel',
 # quantization config
 parser.add_argument('--w_bit', type=int, default=None)
 parser.add_argument('--q_group_size', type=int, default=-1)
+parser.add_argument('--use_kvcache', action='store_true')
+parser.add_argument('--kvcache_bit', type=int, default=8)
+parser.add_argument('--kvcache_groupsize', type=int, default=128)
 parser.add_argument('--no_zero_point',
                     action='store_true',
                     help="disable zero_point")
@@ -135,6 +138,9 @@ def build_model_and_enc(model_path):
                 q_config=q_config,
                 n_samples=128,
                 seqlen=512,
+                use_kvcache=args.use_kvcache,
+                kvcache_bit=args.kvcache_bit,
+                kvcache_groupsize=args.kvcache_groupsize,
                 calib_data='custom',
             )
             if args.dump_awq:
@@ -149,7 +155,7 @@ def build_model_and_enc(model_path):
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
             awq_results = torch.load(args.load_awq, map_location="cpu")
-            apply_awq(model, awq_results)
+            apply_awq(model, awq_results, args.use_kvcache)
 
         # weight quantization
         if args.w_bit is not None:

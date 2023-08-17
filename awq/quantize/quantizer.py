@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from tqdm import tqdm
 import gc
 from .qmodule import ScaledActivation
@@ -36,19 +35,6 @@ def scale_activations(module):
         act = ScaledActivation(module.mlp.act,
                                torch.ones(c, dtype=dtype, device=device))
         set_op_by_name(module, "mlp.act", act)
-
-
-def llama_attention_kvcache(module):
-    if 'llama' in str(module.__class__.__name__).lower():
-        from .qmodule import QuantLLaMaAttention
-        quant_llama_attention = QuantLLaMaAttention(
-            module.self_attn,
-            module.self_attn.max_position_embeddings,
-            module.self_attn.hidden_size,
-            module.self_attn.num_heads,
-            module.self_attn.num_key_value_heads,
-            rope_scaling=module.self_attn.config.rope_scaling)
-        set_op_by_name(module, "self_attn", quant_llama_attention)
 
 
 # core quantization method (simulated quantization)
@@ -124,7 +110,7 @@ def real_quantize_model_weight(
     init_only=False,
     gpu_list=[0],
 ):
-    from .qmodule import WQLinear, QuantLLaMaAttention
+    from .qmodule import WQLinear
     from .pre_quant import get_blocks, get_named_linears
     assert q_config[
         "zero_point"], "We only support zero_point quantization now."
@@ -137,16 +123,14 @@ def real_quantize_model_weight(
         layer = layers[i]
         named_linears = get_named_linears(layer)
         scale_activations(layer)
-
         for name, module in named_linears.items():
             if init_only:
                 q_linear = WQLinear.from_linear(module, w_bit,
                                                 q_config['q_group_size'], True)
             else:
                 module.cuda(int(gpu_list[i * num_gpus // len(layers)]))
-                print(
-                    f'debugging device: {gpu_list[i * num_gpus // len(layers)]}'
-                )
+                print('debugging device:'
+                      f'{gpu_list[i * num_gpus // len(layers)]}')
                 module.weight.data, scales, zeros = pseudo_quantize_tensor(
                     module.weight.data,
                     n_bit=w_bit,
