@@ -129,8 +129,6 @@ def real_quantize_model_weight(
                                                 q_config['q_group_size'], True)
             else:
                 module.cuda(int(gpu_list[i * num_gpus // len(layers)]))
-                print('debugging device:'
-                      f'{gpu_list[i * num_gpus // len(layers)]}')
                 module.weight.data, scales, zeros = pseudo_quantize_tensor(
                     module.weight.data,
                     n_bit=w_bit,

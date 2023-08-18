@@ -57,31 +57,64 @@ class UniformAffineQuantizer(nn.Module):
         self.qmin = -(2**(n_bits - 1))
         self.qmax = 2**(n_bits - 1) - 1
 
-    def quant(self, x, scale, round_zero_point, uint=False):
+    def quant(self,
+              x,
+              scale,
+              round_zero_point,
+              uint=False,
+              group=-1,
+              add_dim=None):
+        # Using broadcast for group quantize to avoid too much permute
+        org_shape = x.shape
+        if group > 0:
+            x = x.reshape(x.shape[:-1] + (-1, group))
+            scale = scale.reshape(-1, x.shape[-2]).unsqueeze(0).unsqueeze(
+                -1)  # Unsqueeze 0 for batch dim, -1 for group dim.
+            round_zero_point = round_zero_point.reshape(
+                -1, x.shape[-2]).unsqueeze(0).unsqueeze(-1)
+            if add_dim:
+                scale = scale.unsqueeze(add_dim)
+                round_zero_point = round_zero_point.unsqueeze(add_dim)
         x_int = (x / scale).round_()
         if uint:
             x_int = x_int.add_(round_zero_point - self.qmin)
             x_int = x_int.clamp_(0, self.qmax - self.qmin).to(torch.uint8)
-            return x_int
+            return x_int.reshape(org_shape)
         else:
             if not self.symmetric:
                 x_int = x_int.add_(round_zero_point)
             x_int = x_int.clamp_(self.qmin, self.qmax).to(torch.int8)
-            return x_int
+            return x_int.reshape(org_shape)
 
-    def dequant(self, x_int, scale, round_zero_point, uint=False):
+    def dequant(self,
+                x_int,
+                scale,
+                round_zero_point,
+                uint=False,
+                group=-1,
+                add_dim=None):
         if not x_int.dtype == scale.dtype:
             x_int = x_int.to(scale.dtype)
+        org_shape = x_int.shape
+        if group > 0:
+            x_int = x_int.reshape(x_int.shape[:-1] + (-1, group))
+            scale = scale.reshape(-1, x_int.shape[-2]).unsqueeze(0).unsqueeze(
+                -1)  # Unsqueeze 0 for batch dim, -1 for group dim.
+            round_zero_point = round_zero_point.reshape(
+                -1, x_int.shape[-2]).unsqueeze(0).unsqueeze(-1)
+            if add_dim:
+                scale = scale.unsqueeze(add_dim)
+                round_zero_point = round_zero_point.unsqueeze(add_dim)
         if uint:
             if round_zero_point is not None:
                 x_int = x_int.sub_(round_zero_point - self.qmin)
             x_dequant = x_int.mul_(scale)
-            return x_dequant
+            return x_dequant.reshape(org_shape)
         else:
             if round_zero_point is not None:
                 x_int = x_int.sub_(round_zero_point)
             x_dequant = x_int.mul_(scale)
-            return x_dequant
+            return x_dequant.reshape(org_shape)
 
     def fake_quant(self, x, scale, round_zero_point):
         # start quantization
@@ -110,45 +143,6 @@ class UniformAffineQuantizer(nn.Module):
         del self.cached_xmin
         del self.cached_xmax
         del self.recorded_quant_input
-
-
-class QuantMatMul(nn.Module):
-
-    def __init__(
-        self,
-        x1_quant_params: dict = {},
-        x2_quant_params: dict = {},
-        disable_act_quant=False,
-        matmul_func=torch.bmm,
-    ):
-        super().__init__()
-        # de-activate the quantized forward default
-        self.use_act_quant = False
-        self.x1_quantizer = UniformAffineQuantizer(**x1_quant_params)
-        self.x2_quantizer = UniformAffineQuantizer(**x2_quant_params)
-        self.matmul_func = matmul_func
-
-        self.disable_act_quant = disable_act_quant
-
-    def set_quant_state(self,
-                        weight_quant: bool = False,
-                        act_quant: bool = False):
-        self.use_weight_quant = weight_quant
-        self.use_act_quant = act_quant
-
-    def quant_x1(self, x1):
-        if self.use_act_quant:
-            x1 = self.x1_quantizer(x1)
-        return x1
-
-    def quant_x2(self, x2):
-        if self.use_act_quant:
-            x2 = self.x2_quantizer(x2)
-        return x2
-
-    def forward(self, x1, x2):
-        out = self.matmul_func(x1, x2)
-        return out
 
 
 class WQLinear(nn.Module):
@@ -322,9 +316,10 @@ class QuantLLaMaAttention(nn.Module):
                         device=dev))
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError("hidden_size must be divisible by num_heads (got"
-                             f"`hidden_size`: {self.hidden_size}"
-                             f" and `num_heads`: {self.num_heads}).")
+            raise ValueError(
+                "hidden_size must be divisible by num_heads "
+                f"(got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads}).")
 
         self.is_decoder = is_decoder
         self._init_rope()
@@ -408,20 +403,19 @@ class QuantLLaMaAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, position_ids)
 
-        quant_key_states = k_cache_quantizer.quant(
-            key_states.transpose(0,
-                                 1).contiguous().reshape(self.num_heads, -1),
-            self.kcache_scales,
-            self.kcache_qzeros,
-            uint=True).reshape(self.num_heads, bsz, -1,
-                               self.head_dim).transpose(0, 1).contiguous()
-        quant_value_states = v_cache_quantizer.quant(
-            value_states.transpose(0,
-                                   1).contiguous().reshape(self.num_heads, -1),
-            self.vcache_scales,
-            self.vcache_qzeros,
-            uint=True).reshape(self.num_heads, bsz, -1,
-                               self.head_dim).transpose(0, 1).contiguous()
+        assert (self.head_dim % self.group_size) == 0
+        quant_key_states = k_cache_quantizer.quant(key_states,
+                                                   self.kcache_scales,
+                                                   self.kcache_qzeros,
+                                                   uint=True,
+                                                   group=self.group_size,
+                                                   add_dim=2)
+        quant_value_states = v_cache_quantizer.quant(value_states,
+                                                     self.vcache_scales,
+                                                     self.vcache_qzeros,
+                                                     uint=True,
+                                                     group=self.group_size,
+                                                     add_dim=2)
         #  Key Value states is now quantized after code if use kvcache
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -443,12 +437,12 @@ class QuantLLaMaAttention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        k_dequant = k_cache_quantizer.dequant(
-            key_states.transpose(0, 1).reshape(self.num_heads, -1),
-            self.kcache_scales,
-            self.kcache_qzeros,
-            uint=True).reshape(self.num_heads, bsz, -1,
-                               self.head_dim).transpose(0, 1)
+        k_dequant = k_cache_quantizer.dequant(key_states,
+                                              self.kcache_scales,
+                                              self.kcache_qzeros,
+                                              uint=True,
+                                              group=self.group_size,
+                                              add_dim=2)
         attn_weights = torch.matmul(query_states,
                                     k_dequant.transpose(2, 3)) \
             / math.sqrt(self.head_dim)
@@ -461,9 +455,11 @@ class QuantLLaMaAttention(nn.Module):
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError("Attention mask should be of size "
-                                 f"{(bsz, 1, q_len, kv_seq_len)}, "
-                                 f"but is {attention_mask.size()}")
+                raise ValueError(
+                    "Attention mask should be of size "
+                    f"{(bsz, 1, q_len, kv_seq_len)}, "
+                    f"but is {attention_mask.size()}"
+                )
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
@@ -472,12 +468,12 @@ class QuantLLaMaAttention(nn.Module):
                                              dim=-1,
                                              dtype=torch.float32).to(
                                                  query_states.dtype)
-        v_dequant = v_cache_quantizer.dequant(
-            value_states.transpose(0, 1).reshape(self.num_heads, -1),
-            self.vcache_scales,
-            self.vcache_qzeros,
-            uint=True).reshape(self.num_heads, bsz, -1,
-                               self.head_dim).transpose(0, 1)
+        v_dequant = v_cache_quantizer.dequant(value_states,
+                                              self.vcache_scales,
+                                              self.vcache_qzeros,
+                                              uint=True,
+                                              group=self.group_size,
+                                              add_dim=2)
         attn_output = torch.matmul(attn_weights, v_dequant)
         del v_dequant
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):

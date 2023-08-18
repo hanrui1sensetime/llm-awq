@@ -42,8 +42,8 @@ def move_embed(model, device):
     if isinstance(model, LlamaForCausalLM):
         model.model.embed_tokens = model.model.embed_tokens.to(device)
     elif isinstance(model, OPTForCausalLM):
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(
-            device)
+        model.model.decoder.embed_tokens = \
+            model.model.decoder.embed_tokens.to(device)
         model.model.decoder.embed_positions = \
             model.model.decoder.embed_positions.to(device)
     elif isinstance(model, BloomForCausalLM):
@@ -197,7 +197,6 @@ def run_awq(
         torch.cuda.empty_cache()
 
         if auto_scale:
-            # if it applies, we should also modify the input_feat with scales
             scales_list = auto_scale_block(
                 layer,
                 layer_kwargs,
